@@ -1,0 +1,162 @@
+Stage B：训练 CSAC baseline checkpoint
+python fix10E_fse_guided_paper_csac.py ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density sparse ^
+  --seeds 40-44 ^
+  --episodes 500 ^
+  --max-steps 400 ^
+  --eval-episodes 20 ^
+  --device cuda:0 ^
+  --enable-scenario-frame ^
+  --checkpoint-save-path results/fix10E_fse_offline/stage0_baseline/{mode}/{seed}/checkpoint.pt ^
+  --train-log-path results/fix10E_fse_offline/stage0_baseline/{mode}/{seed}/train_log.csv ^
+  --train-json-path results/fix10E_fse_offline/stage0_baseline/{mode}/{seed}/train_rows.json ^
+  --run-result-json-path results/fix10E_fse_offline/stage0_baseline/{mode}/{seed}/run_result.json ^
+  --tensorboard-dir results/fix10E_fse_offline/stage0_baseline/{mode}/{seed}/tensorboard ^
+  --multi-seed-summary-path results/fix10E_fse_offline/stage0_baseline/{mode}/multi_seed_summary.json
+
+Stage C：采集三源 FSE raw 数据
+
+采集 online_train 数据
+python fix10E_fse_guided_paper_csac.py ^
+  --fse-task collect ^
+  --fse-collect-policy online_train ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density sparse ^
+  --seeds 40-44 ^
+  --episodes 500 ^
+  --max-steps 400 ^
+  --device cuda:0 ^
+  --start-steps 800 ^
+  --update-after 256 ^
+  --fse-output-dir results/fix10E_fse_offline/stage1_raw/csac_main/sparse/online_train
+
+采集 eval_policy 数据
+python fix10E_fse_guided_paper_csac.py ^
+  --fse-task collect ^
+  --fse-collect-policy eval_policy ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density sparse ^
+  --seeds 40-44 ^
+  --episodes 200 ^
+  --max-steps 400 ^
+  --device cpu ^
+  --policy-checkpoint-path-template results/fix10E_fse_offline/stage0_baseline/paper_csac_lagrangian/{seed}/checkpoint.pt ^
+  --fse-output-dir results/fix10E_fse_offline/stage1_raw/csac_main/sparse/eval_policy
+
+采集 noisy_eval 数据
+python fix10E_fse_guided_paper_csac.py ^
+  --fse-task collect ^
+  --fse-collect-policy noisy_eval ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density sparse ^
+  --seeds 40-44 ^
+  --episodes 100 ^
+  --max-steps 400 ^
+  --device cuda:0 ^
+  --policy-checkpoint-path-template results/fix10E_fse_offline/stage0_baseline/paper_csac_lagrangian/{seed}/checkpoint.pt ^
+  --fse-noise-std-acc 0.15 ^
+  --fse-noise-std-steer 0.05 ^
+  --fse-noise-clip 0.30 ^
+  --fse-output-dir results/fix10E_fse_offline/stage1_raw/csac_main/sparse/noisy_eval
+
+Stage D：构建 FSE dataset
+python fix10E_fse_guided_paper_csac.py ^
+  --fse-task build-dataset ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density sparse ^
+  --seed 42 ^
+  --fse-raw-path "results/fix10E_fse_offline/stage1_raw/csac_main/sparse/online_train/fse_raw_trajectories.npz,results/fix10E_fse_offline/stage1_raw/csac_main/sparse/eval_policy/fse_raw_trajectories.npz,results/fix10E_fse_offline/stage1_raw/csac_main/sparse/noisy_eval/fse_raw_trajectories.npz" ^
+  --fse-output-dir results/fix10E_fse_offline/stage2_dataset/csac_main/sparse
+
+**重新判断**
+
+我认可这个 Hybrid / Representation Bottleneck 方案作为主论文路线。它比“把 `z_fse + risk_probs + exposure + reg + uncertainty` 全部拼进 RL”更干净，也更容易证明贡献：RL 用潜表征，decoder heads 只负责语义锚定、调度和校准。这条线更像表征学习贡献，而不是手工风险特征堆叠。
+
+结合当前 `build-dataset` 结果，我的判断是：
+
+**当前 Stage 2 数据集：通过，可进入 State-conditioned FSE 训练。**
+
+关键证据：
+
+| 项目 | 当前结果 | 判断 |
+|---|---:|---|
+| tokens | `[1304391, 12, 24]` | 符合 ScenarioFrame v1 |
+| `token_mask` | 全部为 1 | 符合固定槽位设计 |
+| `entity_valid_mask` | 有 0/1 区分缺失实体 | 符合“缺失车辆不是 padding”设计 |
+| NaN/Inf | 未发现 | 通过 |
+| memory key 数 | 100 | 小于 200，合理 |
+| episodes | 4000 | 充分 |
+| `valid_rate_H20` | 0.9527 | 通过 |
+| `valid_rate_H40` | 0.9055 | 通过 |
+| H20 low_ttc positive | 42370 | 通过 |
+| H20 unsafe_headway positive | 184101 | 通过 |
+| quality_warnings | `[]` | 通过 |
+
+因此，按你的新方案，当前产物可以作为 **Semantic-Grounded Future Safety Bottleneck** 的离线监督数据集。
+
+但要注意：这个结果只证明 **Step 1/2 数据与标签可用**，还不能证明 `z_fse` 已经是有效的未来安全瓶颈表征。
+
+**主要保留意见**
+
+1. **offroad 可训练，但不能强叙述**
+   
+   H20 offroad 总 support=2288，不是 0，所以可以训练和报告。但在 `eval_policy` 和 `noisy_eval` 中 H20 offroad support 都只有 42，作为 rare-event 提升证据仍偏弱。论文里应报告 support，并对 offroad 改善保持保守。
+
+2. **当前还没有证明 z_fse 有控制价值**
+   
+   现在只是数据集验收通过。下一步必须看：
+   
+   `recall_collision / recall_offroad / recall_low_ttc / AUC / Brier / ECE / monotonic_violation_rate / z_variance`。
+   
+   如果 focal loss 下降但 collision/offroad recall 仍为 0，不能进入 RL 主实验。
+
+3. **source 分析要用 `raw_source_id`，不是 `source_group_id`**
+   
+   当前 `source_group_id` 全为 0，这是 `MAIN_CSAC` 主数据组标识，合理。但区分 `online_train / eval_policy / noisy_eval` 应使用 `raw_source_id` 或 `collect_policy_id`。
+
+4. **uncertainty 当前更像 entropy，不是严格 epistemic uncertainty**
+   
+   用它做第一版 gate 可以，但论文中不要把它写成强 epistemic 估计。更严谨的说法是 prediction entropy-based uncertainty proxy。后续如要更强，可加 ensemble 或 MC dropout。
+
+5. **action-conditioned FSE 必须单独验收梯度**
+   
+   你方案里这点非常关键：FSE 参数冻结，但 action path 不能 `no_grad`。否则 risk penalty 只是日志，不会影响 actor。必须记录 `risk_grad_norm`、`risk_penalty_active_rate`、`uncertainty_gate_mean`。
+
+**最终判断**
+
+当前 `build-dataset` 结果对新方案是正向的：数据结构、mask 语义、标签分布和 memory key 规模都支持进入 Hybrid Bottleneck 路线。
+
+但论文层面的主张还不能写成“方法有效”，只能写成：
+
+> 已完成 Semantic-Grounded FSE Bottleneck 的离线数据构建与标签质量验收，数据满足后续 state-conditioned FSE 训练条件。
+
+下一步最关键的是先训练并验收 **state-conditioned FSE Bottleneck**。只有当 decoder heads 的 rare-event recall、校准指标和 `z_fse` 稳定性通过后，才建议进入 frozen `z_fse` 接入 CSAC 的主实验。
+
+Stage E：训练 state-conditioned FSE 主模型
+python fix10E_fse_guided_paper_csac.py ^
+  --fse-task train ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density sparse ^
+  --seed 42 ^
+  --device cuda:0 ^
+  --fse-dataset-path results/fix10E_fse_offline/stage2_dataset/csac_main/sparse/fse_dataset.npz ^
+  --fse-output-dir results/fix10E_fse_offline/stage3_train/csac_main/sparse/state_fse ^
+  --fse-checkpoint-path results/fix10E_fse_offline/stage3_train/csac_main/sparse/state_fse/fse_checkpoint.pt ^
+  --fse-epochs 40 ^
+  --fse-batch-size 256 ^
+  --fse-lr 3e-4 ^
+  --fse-weight-decay 1e-4 ^
+  --fse-source-balanced-sampler ^
+  --fse-source-ratio "online_train=0.65,eval_policy=0.25,noisy_eval=0.10"
+
+Stage F：独立评估 state-conditioned FSE
+python fix10E_fse_guided_paper_csac.py ^
+  --fse-task eval ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density sparse ^
+  --seed 42 ^
+  --device cuda:0 ^
+  --fse-dataset-path results/fix10E_fse_offline/stage2_dataset/csac_main/sparse/fse_dataset.npz ^
+  --fse-checkpoint-path results/fix10E_fse_offline/stage3_train/csac_main/sparse/state_fse/fse_checkpoint.pt ^
+  --fse-output-dir results/fix10E_fse_offline/stage4_eval/csac_main/sparse/state_fse

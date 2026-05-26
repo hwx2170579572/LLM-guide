@@ -1,0 +1,222 @@
+set SCRIPT=fix10E_fse_guided_paper_csac.py
+set DENSITY=sparse
+set DEVICE=cuda:0
+
+set FSE_DATASET=results/fix10E_fse_offline/stage2_dataset/csac_main/sparse/fse_dataset.npz
+set FSE_CKPT=results/fix10E_fse_offline/stage3_train/csac_main/sparse/state_fse/fse_checkpoint.pt
+
+set STAGEG_ROOT=results/fix10E_fse_offline/stage5_rl_frozen_z/sparse
+set Z_STATS=results/fix10E_fse_offline/stage4_eval/csac_main/sparse/state_fse/fse_z_global_stats.json
+set Z_POOL=results/fix10E_fse_offline/stage4_eval/csac_main/sparse/state_fse/fse_shuffle_pool.npz
+
+
+Stage G.1：single-seed 300 episodes 可行性验证
+2.1 baseline：paper_csac_lagrangian
+python %SCRIPT% ^
+  --mode paper_csac_lagrangian ^
+  --traffic-density %DENSITY% ^
+  --seed 42 ^
+  --device %DEVICE% ^
+  --episodes 300 ^
+  --max-steps 400 ^
+  --eval-episodes 10 ^
+  --train-log-path %STAGEG_ROOT%/stage_g1_single/baseline/42/train_log.csv ^
+  --train-json-path %STAGEG_ROOT%/stage_g1_single/baseline/42/train_log.json ^
+  --run-result-json-path %STAGEG_ROOT%/stage_g1_single/baseline/42/run_result.json ^
+  --checkpoint-save-path %STAGEG_ROOT%/stage_g1_single/baseline/42/checkpoint.pt ^
+  --tensorboard-dir %STAGEG_ROOT%/stage_g1_single/baseline/42/tensorboard
+
+2.2 concat real-z
+python %SCRIPT% ^
+  --mode paper_csac_fse_z_concat ^
+  --traffic-density %DENSITY% ^
+  --seed 42 ^
+  --device %DEVICE% ^
+  --episodes 300 ^
+  --max-steps 400 ^
+  --eval-episodes 10 ^
+  --fse-checkpoint-path %FSE_CKPT% ^
+  --fse-run-tier smoke ^
+  --fse-z-trace-stride 5 ^
+  --fse-z-trace-max-rows 100000 ^
+  --train-log-path %STAGEG_ROOT%/stage_g1_single/z_concat/42/train_log.csv ^
+  --train-json-path %STAGEG_ROOT%/stage_g1_single/z_concat/42/train_log.json ^
+  --run-result-json-path %STAGEG_ROOT%/stage_g1_single/z_concat/42/run_result.json ^
+  --checkpoint-save-path %STAGEG_ROOT%/stage_g1_single/z_concat/42/checkpoint.pt ^
+  --tensorboard-dir %STAGEG_ROOT%/stage_g1_single/z_concat/42/tensorboard
+
+Stage G.1b-0：构建 formal z artifacts
+python "%SCRIPT%" ^
+  --fse-task build-z-artifacts ^
+  --traffic-density %DENSITY% ^
+  --seed 42 ^
+  --device %DEVICE% ^
+  --max-steps 400 ^
+  --fse-dataset-path "%FSE_DATASET%" ^
+  --fse-checkpoint-path "%FSE_CKPT%" ^
+  --fse-run-tier formal ^
+  --fse-z-artifacts both ^
+  --fse-z-artifact-source-split train_val ^
+  --fse-z-artifact-min-samples 1000 ^
+  --fse-z-stats-output-path "%Z_STATS%" ^
+  --fse-shuffle-pool-output-path "%Z_POOL%" ^
+  --fse-output-dir "%STAGEG_ROOT%/stage_g1_single/artifacts/42"
+
+2026.5.25.13.45：Stage G.1b：single-seed 300 episodes 消融验证
+3.1 random formal，300 episodes
+python "%SCRIPT%" ^
+  --mode paper_csac_fse_z_gated_random ^
+  --traffic-density %DENSITY% ^
+  --seed 42 ^
+  --device %DEVICE% ^
+  --episodes 300 ^
+  --max-steps 400 ^
+  --eval-episodes 10 ^
+  --fse-checkpoint-path "%FSE_CKPT%" ^
+  --fse-run-tier formal ^
+  --fse-random-z-distribution global_empirical_matched ^
+  --fse-z-global-stats-path "%Z_STATS%" ^
+  --fse-z-trace-stride 5 ^
+  --fse-z-trace-max-rows 100000 ^
+  --train-log-path "%STAGEG_ROOT%/stage_g1_single/z_gated_random/42/train_log.csv" ^
+  --train-json-path "%STAGEG_ROOT%/stage_g1_single/z_gated_random/42/train_log.json" ^
+  --run-result-json-path "%STAGEG_ROOT%/stage_g1_single/z_gated_random/42/run_result.json" ^
+  --checkpoint-save-path "%STAGEG_ROOT%/stage_g1_single/z_gated_random/42/checkpoint.pt" ^
+  --tensorboard-dir "%STAGEG_ROOT%/stage_g1_single/z_gated_random/42/tensorboard"
+
+3.2 shuffled formal，300 episodes
+python "%SCRIPT%" ^
+  --mode paper_csac_fse_z_gated_shuffled ^
+  --traffic-density %DENSITY% ^
+  --seed 42 ^
+  --device %DEVICE% ^
+  --episodes 300 ^
+  --max-steps 400 ^
+  --eval-episodes 10 ^
+  --fse-checkpoint-path "%FSE_CKPT%" ^
+  --fse-run-tier formal ^
+  --fse-random-z-distribution global_empirical_matched ^
+  --fse-z-global-stats-path "%Z_STATS%" ^
+  --fse-shuffle-pool-path "%Z_POOL%" ^
+  --fse-z-trace-stride 5 ^
+  --fse-z-trace-max-rows 100000 ^
+  --train-log-path "%STAGEG_ROOT%/stage_g1_single/z_gated_shuffled/42/train_log.csv" ^
+  --train-json-path "%STAGEG_ROOT%/stage_g1_single/z_gated_shuffled/42/train_log.json" ^
+  --run-result-json-path "%STAGEG_ROOT%/stage_g1_single/z_gated_shuffled/42/run_result.json" ^
+  --checkpoint-save-path "%STAGEG_ROOT%/stage_g1_single/z_gated_shuffled/42/checkpoint.pt" ^
+  --tensorboard-dir "%STAGEG_ROOT%/stage_g1_single/z_gated_shuffled/42/tensorboard"
+
+3.3 zero formal，300 episodes
+python "%SCRIPT%" ^
+  --mode paper_csac_fse_z_gated_zero ^
+  --traffic-density %DENSITY% ^
+  --seed 42 ^
+  --device %DEVICE% ^
+  --episodes 300 ^
+  --max-steps 400 ^
+  --eval-episodes 10 ^
+  --fse-checkpoint-path "%FSE_CKPT%" ^
+  --fse-run-tier formal ^
+  --fse-z-trace-stride 5 ^
+  --fse-z-trace-max-rows 100000 ^
+  --train-log-path "%STAGEG_ROOT%/stage_g1_single/z_gated_zero/42/train_log.csv" ^
+  --train-json-path "%STAGEG_ROOT%/stage_g1_single/z_gated_zero/42/train_log.json" ^
+  --run-result-json-path "%STAGEG_ROOT%/stage_g1_single/z_gated_zero/42/run_result.json" ^
+  --checkpoint-save-path "%STAGEG_ROOT%/stage_g1_single/z_gated_zero/42/checkpoint.pt" ^
+  --tensorboard-dir "%STAGEG_ROOT%/stage_g1_single/z_gated_zero/42/tensorboard"
+
+set SCRIPT=fix10E_fse_guided_paper_csac.py
+set DENSITY=sparse
+set DEVICE=cuda:0
+
+set STAGEG_ROOT=results/fix10E_fse_offline/stage5_rl_frozen_z/sparse
+set STAGEG2_ROOT=%STAGEG_ROOT%/stage_g2_formal_5seed_eval100
+
+set FSE_DATASET=results/fix10E_fse_offline/stage2_dataset/csac_main/sparse/fse_dataset.npz
+set FSE_CKPT=results/fix10E_fse_offline/stage3_train/csac_main/sparse/state_fse/fse_checkpoint.pt
+
+set Z_STATS=%STAGEG2_ROOT%/artifacts/fse_z_global_stats.json
+set Z_POOL=%STAGEG2_ROOT%/artifacts/fse_shuffle_pool.npz
+
+set SEEDS=40-44
+set EVAL_EPISODES=100
+
+1. 先构建 formal z artifacts
+python "%SCRIPT%" ^
+  --fse-task build-z-artifacts ^
+  --traffic-density %DENSITY% ^
+  --seed 42 ^
+  --device %DEVICE% ^
+  --max-steps 400 ^
+  --fse-dataset-path "%FSE_DATASET%" ^
+  --fse-checkpoint-path "%FSE_CKPT%" ^
+  --fse-run-tier formal ^
+  --fse-z-artifacts both ^
+  --fse-z-artifact-source-split train_val ^
+  --fse-z-artifact-min-samples 1000 ^
+  --fse-z-stats-output-path "%Z_STATS%" ^
+  --fse-shuffle-pool-output-path "%Z_POOL%" ^
+  --fse-output-dir "%STAGEG2_ROOT%/artifacts"
+
+2. 同配置跑 real-z / zero / random / shuffled，5 seeds
+python "%SCRIPT%" ^
+  --modes "paper_csac_fse_z_gated paper_csac_fse_z_gated_zero paper_csac_fse_z_gated_random paper_csac_fse_z_gated_shuffled" ^
+  --traffic-density %DENSITY% ^
+  --seeds %SEEDS% ^
+  --device %DEVICE% ^
+  --episodes 300 ^
+  --max-steps 400 ^
+  --eval-episodes %EVAL_EPISODES% ^
+  --fse-checkpoint-path "%FSE_CKPT%" ^
+  --fse-run-tier formal ^
+  --fse-random-z-distribution global_empirical_matched ^
+  --fse-z-global-stats-path "%Z_STATS%" ^
+  --fse-shuffle-pool-path "%Z_POOL%" ^
+  --fse-z-trace-stride 5 ^
+  --fse-z-trace-max-rows 100000 ^
+  --train-log-path "%STAGEG2_ROOT%/{mode}/{seed}/train_log.csv" ^
+  --train-json-path "%STAGEG2_ROOT%/{mode}/{seed}/train_log.json" ^
+  --run-result-json-path "%STAGEG2_ROOT%/{mode}/{seed}/run_result.json" ^
+  --checkpoint-save-path "%STAGEG2_ROOT%/{mode}/{seed}/checkpoint.pt" ^
+  --tensorboard-dir "%STAGEG2_ROOT%/{mode}/{seed}/tensorboard" ^
+  --multi-seed-summary-path "%STAGEG2_ROOT%/multi_mode_summary.json"
+
+Stage G.4：dense 泛化验证
+使用 sparse FSE checkpoint，这是 cross-density generalization
+
+set SCRIPT=fix10E_fse_guided_paper_csac.py
+set DENSITY=dense
+
+set STAGEG_ROOT=results/fix10E_fse_offline/stage5_rl_frozen_z/dense
+set STAGEG2_ROOT=%STAGEG_ROOT%/stage_g2_formal_5seed_eval100
+
+set DEVICE=cpu
+
+set FSE_DATASET=results/fix10E_fse_offline/stage2_dataset/csac_main/sparse/fse_dataset.npz
+set FSE_CKPT=results/fix10E_fse_offline/stage3_train/csac_main/sparse/state_fse/fse_checkpoint.pt
+
+set STAGEG_ROOT=results/fix10E_fse_offline/stage5_rl_frozen_z/sparse
+set Z_STATS=results/fix10E_fse_offline/stage4_eval/csac_main/sparse/state_fse/fse_z_global_stats.json
+set Z_POOL=results/fix10E_fse_offline/stage4_eval/csac_main/sparse/state_fse/fse_shuffle_pool.npz
+
+set SEEDS=40-42
+set EVAL_EPISODES=100
+
+python "%SCRIPT%" ^
+  --modes paper_csac_lagrangian,paper_csac_fse_z_concat,paper_csac_fse_z_gated ^
+  --seeds 40-42 ^
+  --traffic-density dense ^
+  --device %DEVICE% ^
+  --episodes 300 ^
+  --max-steps 400 ^
+  --eval-episodes 10 ^
+  --fse-checkpoint-path "%FSE_CKPT%" ^
+  --fse-run-tier smoke ^
+  --fse-z-trace-stride 100 ^
+  --fse-z-trace-max-rows 80000 ^
+  --train-log-path "%STAGEG_ROOT%/stage_g4_dense3/{mode}/{seed}/train_log.csv" ^
+  --train-json-path "%STAGEG_ROOT%/stage_g4_dense3/{mode}/{seed}/train_log.json" ^
+  --run-result-json-path "%STAGEG_ROOT%/stage_g4_dense3/{mode}/{seed}/run_result.json" ^
+  --checkpoint-save-path "%STAGEG_ROOT%/stage_g4_dense3/{mode}/{seed}/checkpoint.pt" ^
+  --tensorboard-dir "%STAGEG_ROOT%/stage_g4_dense3/{mode}/{seed}/tensorboard" ^
+  --multi-seed-summary-path "%STAGEG_ROOT%/stage_g4_dense3/summary_dense3.json"

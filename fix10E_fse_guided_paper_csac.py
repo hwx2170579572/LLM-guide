@@ -2961,6 +2961,54 @@ class FSEStepZ:
     random_std_clipped_dims: int = 0
 
 
+class RunningMean:
+    def __init__(self):
+        self.count = 0
+        self.total = 0.0
+        self.skipped_nonfinite = 0
+
+    def update(self, value: float) -> None:
+        try:
+            v = float(value)
+        except Exception:
+            return
+        if not np.isfinite(v):
+            self.skipped_nonfinite += 1
+            return
+        self.count += 1
+        self.total += v
+
+    def mean(self, empty: float = float("nan")) -> float:
+        return float(self.total / float(self.count)) if self.count > 0 else float(empty)
+
+
+class RunningVectorVariance:
+    def __init__(self, dim: int):
+        self.dim = int(dim)
+        self.count = 0
+        self.mean = np.zeros((self.dim,), dtype=np.float64)
+        self.m2 = np.zeros((self.dim,), dtype=np.float64)
+        self.skipped_nonfinite = 0
+
+    def update(self, x: np.ndarray) -> None:
+        arr = np.asarray(x, dtype=np.float64).reshape(-1)
+        if arr.shape[0] != self.dim:
+            raise ValueError(f"RunningVectorVariance expected dim={self.dim}, got {arr.shape[0]}.")
+        if not np.all(np.isfinite(arr)):
+            self.skipped_nonfinite += 1
+            return
+        self.count += 1
+        delta = arr - self.mean
+        self.mean += delta / float(self.count)
+        delta2 = arr - self.mean
+        self.m2 += delta * delta2
+
+    def batch_variance_mean(self, empty: float = float("nan")) -> float:
+        if self.count <= 0:
+            return float(empty)
+        return float(np.mean(self.m2 / float(self.count)))
+
+
 class FSEZDiagnostics:
     def __init__(self, z_dim: int, trace_stride: int = 1, trace_max_rows: int = 200000):
         self.z_dim = int(z_dim)
@@ -2968,6 +3016,17 @@ class FSEZDiagnostics:
         self.trace_max_rows = max(0, int(trace_max_rows))
         self.trace_rows: List[Dict[str, Any]] = []
         self._step_counter = 0
+        self.z_used_dim_var = RunningMean()
+        self.z_real_dim_var = RunningMean()
+        self.z_used_batch_var = RunningVectorVariance(self.z_dim)
+        self.z_real_batch_var = RunningVectorVariance(self.z_dim)
+        self.z_used_norm_mean = RunningMean()
+        self.z_real_norm_mean = RunningMean()
+        self.z_used_abs_mean = RunningMean()
+        self.z_real_abs_mean = RunningMean()
+        self.z_used_temporal_delta_mean = RunningMean()
+        self.z_real_temporal_delta_mean = RunningMean()
+        self.z_norm_ratios: List[float] = []
         self.reset_episode()
         self.total_records = 0
         self.shuffle_cross_episode = 0
@@ -2981,16 +3040,6 @@ class FSEZDiagnostics:
         self.next_state_aug_inf_count = 0
 
     def reset_episode(self) -> None:
-        if not hasattr(self, "z_real_values"):
-            self.z_real_values: List[np.ndarray] = []
-            self.z_used_values: List[np.ndarray] = []
-            self.z_real_temporal_deltas: List[float] = []
-            self.z_used_temporal_deltas: List[float] = []
-            self.z_norm_ratios: List[float] = []
-            self.z_used_norms: List[float] = []
-            self.z_real_norms: List[float] = []
-            self.z_used_abs: List[float] = []
-            self.z_real_abs: List[float] = []
         self._prev_z_real: Optional[np.ndarray] = None
         self._prev_z_used: Optional[np.ndarray] = None
 
@@ -3011,19 +3060,21 @@ class FSEZDiagnostics:
     ) -> None:
         self.total_records += 1
         z_used = self._finite_vec(current.z_used)
-        self.z_used_values.append(z_used)
-        self.z_used_norms.append(float(np.linalg.norm(z_used)))
-        self.z_used_abs.append(float(np.mean(np.abs(z_used))))
+        self.z_used_batch_var.update(z_used)
+        self.z_used_dim_var.update(float(np.var(z_used)))
+        self.z_used_norm_mean.update(float(np.linalg.norm(z_used)))
+        self.z_used_abs_mean.update(float(np.mean(np.abs(z_used))))
         if self._prev_z_used is not None:
-            self.z_used_temporal_deltas.append(float(np.linalg.norm(z_used - self._prev_z_used)))
+            self.z_used_temporal_delta_mean.update(float(np.linalg.norm(z_used - self._prev_z_used)))
         self._prev_z_used = z_used.copy()
         if bool(current.z_real_valid):
             z_real = self._finite_vec(current.z_real)
-            self.z_real_values.append(z_real)
-            self.z_real_norms.append(float(np.linalg.norm(z_real)))
-            self.z_real_abs.append(float(np.mean(np.abs(z_real))))
+            self.z_real_batch_var.update(z_real)
+            self.z_real_dim_var.update(float(np.var(z_real)))
+            self.z_real_norm_mean.update(float(np.linalg.norm(z_real)))
+            self.z_real_abs_mean.update(float(np.mean(np.abs(z_real))))
             if self._prev_z_real is not None:
-                self.z_real_temporal_deltas.append(float(np.linalg.norm(z_real - self._prev_z_real)))
+                self.z_real_temporal_delta_mean.update(float(np.linalg.norm(z_real - self._prev_z_real)))
             self._prev_z_real = z_real.copy()
         raw = np.asarray(raw_state, dtype=np.float32).reshape(-1)
         self.z_norm_ratios.append(float(np.linalg.norm(z_used) / (np.linalg.norm(raw) + 1e-6)))
@@ -3079,33 +3130,19 @@ class FSEZDiagnostics:
     def _safe_percentile(values: List[float], q: float) -> float:
         return float(np.percentile(values, q)) if values else float("nan")
 
-    @staticmethod
-    def _batch_variance(values: List[np.ndarray]) -> float:
-        if len(values) <= 1:
-            return 0.0 if values else float("nan")
-        arr = np.stack(values, axis=0).astype(np.float32)
-        return float(np.mean(np.var(arr, axis=0)))
-
-    @staticmethod
-    def _dim_variance(values: List[np.ndarray]) -> float:
-        if not values:
-            return float("nan")
-        arr = np.stack(values, axis=0).astype(np.float32)
-        return float(np.mean(np.var(arr, axis=1)))
-
     def fields(self) -> Dict[str, float]:
         total = max(1, int(self.total_records))
         return {
-            "fse_z_real_norm_mean": self._safe_mean(self.z_real_norms),
-            "fse_z_used_norm_mean": self._safe_mean(self.z_used_norms),
-            "fse_z_used_abs_mean": self._safe_mean(self.z_used_abs),
-            "fse_z_real_abs_mean": self._safe_mean(self.z_real_abs),
-            "fse_z_real_dim_variance_mean": self._dim_variance(self.z_real_values),
-            "fse_z_used_dim_variance_mean": self._dim_variance(self.z_used_values),
-            "fse_z_real_batch_variance_mean": self._batch_variance(self.z_real_values),
-            "fse_z_used_batch_variance_mean": self._batch_variance(self.z_used_values),
-            "fse_z_real_temporal_delta_mean": self._safe_mean(self.z_real_temporal_deltas),
-            "fse_z_used_temporal_delta_mean": self._safe_mean(self.z_used_temporal_deltas),
+            "fse_z_real_norm_mean": self.z_real_norm_mean.mean(),
+            "fse_z_used_norm_mean": self.z_used_norm_mean.mean(),
+            "fse_z_used_abs_mean": self.z_used_abs_mean.mean(),
+            "fse_z_real_abs_mean": self.z_real_abs_mean.mean(),
+            "fse_z_real_dim_variance_mean": self.z_real_dim_var.mean(),
+            "fse_z_used_dim_variance_mean": self.z_used_dim_var.mean(),
+            "fse_z_real_batch_variance_mean": self.z_real_batch_var.batch_variance_mean(),
+            "fse_z_used_batch_variance_mean": self.z_used_batch_var.batch_variance_mean(),
+            "fse_z_real_temporal_delta_mean": self.z_real_temporal_delta_mean.mean(),
+            "fse_z_used_temporal_delta_mean": self.z_used_temporal_delta_mean.mean(),
             "fse_state_aug_norm_ratio_p10": self._safe_percentile(self.z_norm_ratios, 10),
             "fse_state_aug_norm_ratio_p50": self._safe_percentile(self.z_norm_ratios, 50),
             "fse_state_aug_norm_ratio_p90": self._safe_percentile(self.z_norm_ratios, 90),
