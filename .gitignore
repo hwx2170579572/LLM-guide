@@ -1,0 +1,38 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# virtual environments
+.venv/
+venv/
+env/
+
+# experiment outputs
+results/
+runs/
+logs/
+tensorboard/
+events.out.tfevents.*
+*.tfevents.*
+
+# model checkpoints and datasets
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.pkl
+
+# compressed files
+*.zip
+*.rar
+*.7z
+
+# temporary files
+*.tmp
+*.log
+
+# optional: ignore local VSCode settings
+.vscode/
