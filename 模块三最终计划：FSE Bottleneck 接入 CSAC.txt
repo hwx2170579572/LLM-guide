@@ -220,3 +220,6 @@ python "%SCRIPT%" ^
   --checkpoint-save-path "%STAGEG_ROOT%/stage_g4_dense3/{mode}/{seed}/checkpoint.pt" ^
   --tensorboard-dir "%STAGEG_ROOT%/stage_g4_dense3/{mode}/{seed}/tensorboard" ^
   --multi-seed-summary-path "%STAGEG_ROOT%/stage_g4_dense3/summary_dense3.json"
+
+加交互图
+llm输出未来轨迹序列

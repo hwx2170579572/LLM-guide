@@ -46,13 +46,17 @@ except Exception:
     SummaryWriter = None
 
 
+FSE_ACTION_RISK_MODES = [
+    "paper_csac_fse_z_gated_action_risk",
+    "paper_csac_fse_z_gated_action_risk_shuffled_tokens",
+]
 FSE_RL_MODES = [
     "paper_csac_fse_z_concat",
     "paper_csac_fse_z_gated",
     "paper_csac_fse_z_gated_random",
     "paper_csac_fse_z_gated_shuffled",
     "paper_csac_fse_z_gated_zero",
-]
+] + FSE_ACTION_RISK_MODES
 ALL_MODES = ["paper_sac_pure", "paper_csac_lagrangian"] + FSE_RL_MODES
 FSE_TASKS = ["none", "collect", "build-dataset", "build-z-artifacts", "train", "eval", "full", "smoke"]
 FSE_COLLECT_POLICIES = ["online_train", "eval_policy", "noisy_eval", "random"]
@@ -68,6 +72,8 @@ FSE_RL_MODE_CONFIG = {
     "paper_csac_fse_z_gated_random": ("gated", "random"),
     "paper_csac_fse_z_gated_shuffled": ("gated", "shuffled"),
     "paper_csac_fse_z_gated_zero": ("gated", "zero"),
+    "paper_csac_fse_z_gated_action_risk": ("gated", "real"),
+    "paper_csac_fse_z_gated_action_risk_shuffled_tokens": ("gated", "real"),
 }
 FSE_FORBIDDEN_FORMAL_Z_SOURCE_SPLITS = {"test", "mixed_test", "final_mixed_test", "final_test"}
 PENALTY_IMPLS = ["legacy_fixed_penalty", "stage4_constrained_recurrent_v1"]
@@ -130,6 +136,10 @@ FSE_LANE_BOUNDARY_MARGIN_THRESHOLD = 0.3
 FSE_LANE_OFFSET_RATIO_THRESHOLD = 0.45
 FSE_COST_SAFETY_DEFINITION = "max(cost_collision,cost_headway,cost_lane)"
 FSE_COST_LANE_DEFINITION = "current script cost_lane from compute_costs; verify no task-preference terms before using as safety exposure"
+FSE_ACTION_SPACE_POLICY_NORMALIZED = "policy_normalized_tanh"
+FSE_ACTION_ORDER = ("acceleration", "steering")
+FSE_ACTION_RISK_WEIGHTS = (1.0, 0.7, 0.6, 0.9, 0.4)
+FSE_ACTION_RISK_HORIZON_WEIGHTS = (0.50, 0.35, 0.15)
 
 
 @dataclass
@@ -390,6 +400,14 @@ class FSEConfig:
     output_dir: str = "results/fse"
     checkpoint_path: str = ""
     action_conditioned: bool = False
+    action_risk_checkpoint_path: str = ""
+    action_risk_acceptance_json: str = ""
+    strict_action_gate: bool = False
+    action_risk_beta: float = 0.05
+    action_risk_uncertainty_kappa: float = 2.0
+    action_risk_grad_diag_interval: int = 50
+    action_risk_active_threshold: float = 0.05
+    action_risk_gate_active_threshold: float = 0.10
     collect_policy: str = "online_train"
     policy_checkpoint_path: str = ""
     policy_checkpoint_path_template: str = ""
@@ -513,6 +531,14 @@ def is_fse_rl_mode(mode: str) -> bool:
     return str(mode).lower().strip() in FSE_RL_MODES
 
 
+def is_fse_action_risk_mode(mode: str) -> bool:
+    return str(mode).lower().strip() in FSE_ACTION_RISK_MODES
+
+
+def is_fse_action_risk_shuffled_mode(mode: str) -> bool:
+    return str(mode).lower().strip() == "paper_csac_fse_z_gated_action_risk_shuffled_tokens"
+
+
 def stable_int_hash(*items: object) -> int:
     payload = "|".join(map(str, items)).encode("utf-8")
     return int(hashlib.sha256(payload).hexdigest()[:16], 16)
@@ -543,6 +569,46 @@ def count_all_params(module: Optional[nn.Module]) -> int:
     if module is None:
         return 0
     return int(sum(p.numel() for p in module.parameters()))
+
+
+def count_nonzero_grad_params(module: Optional[nn.Module]) -> int:
+    if module is None:
+        return 0
+    count = 0
+    for p in module.parameters():
+        if p.grad is not None:
+            count += int(torch.any(p.grad.detach() != 0).item())
+    return int(count)
+
+
+def model_weight_sha256(module: nn.Module) -> str:
+    h = hashlib.sha256()
+    for _, tensor in sorted(module.state_dict().items(), key=lambda kv: kv[0]):
+        arr = tensor.detach().cpu().contiguous().numpy()
+        h.update(arr.tobytes())
+    return h.hexdigest()
+
+
+def env_action_to_policy_norm_tensor(action_env: torch.Tensor, action_scale: torch.Tensor, action_bias: torch.Tensor) -> torch.Tensor:
+    return torch.clamp((action_env - action_bias) / torch.clamp(action_scale, min=1e-6), -1.0, 1.0)
+
+
+def policy_norm_to_env_action_tensor(action_norm: torch.Tensor, action_scale: torch.Tensor, action_bias: torch.Tensor) -> torch.Tensor:
+    return action_bias + action_scale * torch.clamp(action_norm, -1.0, 1.0)
+
+
+def env_action_to_policy_norm_np(action_env: np.ndarray, action_low: np.ndarray, action_high: np.ndarray) -> np.ndarray:
+    action_env = np.asarray(action_env, dtype=np.float32)
+    low = np.asarray(action_low, dtype=np.float32).reshape(1, -1)
+    high = np.asarray(action_high, dtype=np.float32).reshape(1, -1)
+    scale = np.maximum((high - low) * 0.5, 1e-6).astype(np.float32)
+    bias = ((high + low) * 0.5).astype(np.float32)
+    return np.clip((action_env - bias) / scale, -1.0, 1.0).astype(np.float32)
+
+
+def default_policy_action_bounds(action_dim: int) -> Tuple[np.ndarray, np.ndarray]:
+    dim = max(1, int(action_dim))
+    return -np.ones((dim,), dtype=np.float32), np.ones((dim,), dtype=np.float32)
 
 
 def get_config() -> Config:
@@ -750,6 +816,9 @@ def _effective_feature_flags(cfg: Config) -> Dict[str, Any]:
         "enable_scenario_frame": bool(cfg.train.enable_scenario_frame),
         "fse_task": str(cfg.fse.task),
         "fse_action_conditioned": bool(cfg.fse.action_conditioned),
+        "fse_action_risk_enabled": bool(is_fse_action_risk_mode(cfg.train.mode)),
+        "fse_action_risk_beta": float(cfg.fse.action_risk_beta),
+        "fse_action_risk_uncertainty_kappa": float(cfg.fse.action_risk_uncertainty_kappa),
     }
 
 
@@ -1872,6 +1941,8 @@ def load_fse_npz_dataset(path: str, fse_cfg: FSEConfig) -> Tuple[Dict[str, np.nd
             warnings["legacy_entity_valid_mask_reconstructed"] = True
         if "actions" in available:
             data["actions"] = _as_fse_array(npz, "actions", np.float32)
+        if "actions_policy_norm" in available:
+            data["actions_policy_norm"] = _as_fse_array(npz, "actions_policy_norm", np.float32)
         if "memory_key" in available:
             data["memory_key"] = np.asarray(npz["memory_key"])
         for key in (
@@ -1915,6 +1986,15 @@ def load_fse_npz_dataset(path: str, fse_cfg: FSEConfig) -> Tuple[Dict[str, np.nd
             raise ValueError(f"{key} must have shape {expected}, got {tuple(data[key].shape)}.")
     if data["episode_id"].shape[0] != n or data["episode_uid_id"].shape[0] != n or data["step_id"].shape[0] != n:
         raise ValueError("episode_uid_id/episode_id and step_id must have length N.")
+    if "actions_policy_norm" in data:
+        if data["actions_policy_norm"].ndim != 2 or data["actions_policy_norm"].shape[0] != n:
+            raise ValueError("actions_policy_norm must have shape [N, action_dim].")
+        data["actions_for_fse"] = np.clip(data["actions_policy_norm"].astype(np.float32), -1.0, 1.0)
+    elif "actions" in data:
+        if data["actions"].ndim != 2 or data["actions"].shape[0] != n:
+            raise ValueError("actions must have shape [N, action_dim].")
+        data["actions_for_fse"] = data["actions"].astype(np.float32)
+        warnings["legacy_actions_used_for_action_fse"] = True
     neighbor_flag = data["tokens"][:, 1: 1 + len(SCENARIO_NEIGHBOR_ROLES), 0] > 0.5
     neighbor_mask = data["entity_valid_mask"][:, 1: 1 + len(SCENARIO_NEIGHBOR_ROLES)] > 0.5
     warnings["entity_valid_mismatch_count"] = int(np.logical_xor(neighbor_flag, neighbor_mask).sum())
@@ -2202,9 +2282,10 @@ def make_fse_batch(
         "valid_mask": torch.as_tensor(data["valid_mask"][idx], dtype=torch.float32, device=device),
     }
     if action_conditioned:
-        if "actions" not in data:
-            raise ValueError("Action-conditioned FSE requires dataset key 'actions'.")
-        batch["action"] = torch.as_tensor(data["actions"][idx], dtype=torch.float32, device=device)
+        action_key = "actions_for_fse" if "actions_for_fse" in data else "actions_policy_norm" if "actions_policy_norm" in data else "actions"
+        if action_key not in data:
+            raise ValueError("Action-conditioned FSE requires dataset key 'actions_policy_norm' or 'actions'.")
+        batch["action"] = torch.as_tensor(data[action_key][idx], dtype=torch.float32, device=device)
     return batch
 
 
@@ -2520,6 +2601,7 @@ def fse_make_checkpoint(
     model: FSEBottleneckTransformer,
     fse_cfg: FSEConfig,
     action_conditioned: bool,
+    action_dim: int,
     best_score: float,
     best_metric: Dict[str, Any],
     support_summary: Dict[str, Any],
@@ -2546,6 +2628,14 @@ def fse_make_checkpoint(
         "token_dim": int(SCENARIO_TOKEN_DIM),
         "n_tokens": int(SCENARIO_TOKEN_COUNT),
         "action_conditioned": bool(action_conditioned),
+        "action_dim": int(action_dim if action_conditioned else 0),
+        "action_metadata": {
+            "action_space": FSE_ACTION_SPACE_POLICY_NORMALIZED if action_conditioned else "none",
+            "action_dim": int(action_dim if action_conditioned else 0),
+            "action_low": [-1.0, -1.0] if action_conditioned else [],
+            "action_high": [1.0, 1.0] if action_conditioned else [],
+            "action_order": list(FSE_ACTION_ORDER) if action_conditioned else [],
+        },
         "normalization_spec": {
             "tokens": "ScenarioFrame v1 normalized 12x24 tokens",
             "labels_binary": "binary in {0,1}",
@@ -2741,9 +2831,9 @@ def run_fse_train(cfg: Config) -> Dict[str, Any]:
     data, load_warnings = load_fse_npz_dataset(str(fse_cfg.dataset_path), fse_cfg)
     splits = split_fse_by_episode(data, seed=int(cfg.train.seed), fse_cfg=fse_cfg)
     action_conditioned = bool(fse_cfg.action_conditioned)
-    action_dim = int(data["actions"].shape[1]) if action_conditioned and "actions" in data else 0
+    action_dim = int(data["actions_for_fse"].shape[1]) if action_conditioned and "actions_for_fse" in data else 0
     if action_conditioned and action_dim <= 0:
-        raise ValueError("--fse-action-conditioned requires dataset key 'actions' with shape [N, action_dim].")
+        raise ValueError("--fse-action-conditioned requires dataset key 'actions_policy_norm' or 'actions' with shape [N, action_dim].")
     model = build_fse_model(fse_cfg, action_dim=action_dim, device=device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(fse_cfg.lr), weight_decay=float(fse_cfg.weight_decay))
     rng = np.random.default_rng(int(cfg.train.seed))
@@ -2817,6 +2907,7 @@ def run_fse_train(cfg: Config) -> Dict[str, Any]:
                 model,
                 fse_cfg,
                 action_conditioned=action_conditioned,
+                action_dim=action_dim,
                 best_score=best_score,
                 best_metric=best_metric,
                 support_summary=val_metrics.get("support_summary", {}),
@@ -2907,7 +2998,9 @@ def run_fse_eval(cfg: Config) -> Dict[str, Any]:
     fse_cfg.output_dir = output_dir
     data, load_warnings = load_fse_npz_dataset(str(fse_cfg.dataset_path), fse_cfg)
     action_conditioned = bool(checkpoint.get("action_conditioned", False))
-    action_dim = int(data["actions"].shape[1]) if action_conditioned and "actions" in data else 0
+    action_dim = int(data["actions_for_fse"].shape[1]) if action_conditioned and "actions_for_fse" in data else 0
+    if action_conditioned and action_dim <= 0:
+        raise ValueError("Action-conditioned FSE eval requires dataset key 'actions_policy_norm' or 'actions' with shape [N, action_dim].")
     model = build_fse_model(fse_cfg, action_dim=action_dim, device=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     splits = split_fse_by_episode(data, seed=int(cfg.train.seed), fse_cfg=fse_cfg)
@@ -2930,6 +3023,8 @@ def run_fse_eval(cfg: Config) -> Dict[str, Any]:
             "risk_names": checkpoint.get("risk_names", []),
             "horizons": checkpoint.get("horizons", []),
             "action_conditioned": bool(action_conditioned),
+            "action_dim": int(checkpoint.get("action_dim", action_dim)),
+            "action_metadata": _jsonable_plain(checkpoint.get("action_metadata", {})),
             "best_score": checkpoint.get("best_score", float("nan")),
             "support_summary": checkpoint.get("support_summary", {}),
         },
@@ -2959,6 +3054,17 @@ class FSEStepZ:
     shuffled_self_sample_flag: bool = False
     shuffled_nearby_episode_sample_flag: bool = False
     random_std_clipped_dims: int = 0
+
+
+@dataclass
+class ActionRiskPenaltyOutput:
+    risk_raw: torch.Tensor
+    risk_norm: torch.Tensor
+    uncertainty_scalar: torch.Tensor
+    uncertainty_gate: torch.Tensor
+    risk_penalty: torch.Tensor
+    risk_probs: torch.Tensor
+    uncertainty: torch.Tensor
 
 
 class RunningMean:
@@ -3602,6 +3708,257 @@ class FrozenFSEBottleneckRuntime:
         raise ValueError(f"Unsupported z_mode: {self.z_mode}")
 
 
+class FrozenActionFSEPenaltyRuntime:
+    def __init__(self, cfg: Config, action_dim: int, output_dir: str = ""):
+        self.cfg = cfg
+        self.device = torch.device(cfg.train.device)
+        self.expected_action_dim = int(action_dim)
+        self.output_dir = str(output_dir or "").strip()
+        self.warning_messages: List[str] = []
+        self.error_type = ""
+        self.forward_count = 0
+        checkpoint_path = str(cfg.fse.action_risk_checkpoint_path).strip()
+        if not checkpoint_path:
+            self.error_type = "missing_action_risk_checkpoint_error"
+            raise ValueError("Action-risk modes require --fse-action-risk-checkpoint-path.")
+        if not os.path.exists(checkpoint_path):
+            self.error_type = "missing_action_risk_checkpoint_error"
+            raise FileNotFoundError(f"Action-FSE checkpoint not found: {checkpoint_path}")
+        gate_path = str(cfg.fse.action_risk_acceptance_json).strip()
+        if not gate_path:
+            self.error_type = "missing_action_risk_acceptance_gate_error"
+            raise ValueError("Action-risk modes require --fse-action-risk-acceptance-json.")
+        if not os.path.exists(gate_path):
+            self.error_type = "missing_action_risk_acceptance_gate_error"
+            raise FileNotFoundError(f"Action-FSE acceptance gate not found: {gate_path}")
+
+        self.checkpoint_path = checkpoint_path
+        self.acceptance_gate_path = gate_path
+        self.checkpoint_sha256 = sha256_file(checkpoint_path)
+        self.acceptance_gate_sha256 = sha256_file(gate_path)
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        except TypeError:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.checkpoint = checkpoint
+        self.acceptance_gate = json.loads(open(gate_path, "r", encoding="utf-8").read())
+        self.fse_cfg = _fse_config_from_payload(checkpoint.get("fse_config", asdict(cfg.fse)))
+        self.action_dim = self._checkpoint_action_dim(checkpoint)
+        self.z_dim = int(checkpoint.get("z_dim", getattr(self.fse_cfg, "z_dim", 64)))
+        self._validate_checkpoint(checkpoint)
+        self._validate_acceptance_gate(self.acceptance_gate)
+        self.model = build_fse_model(self.fse_cfg, action_dim=int(self.action_dim), device=self.device)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.eval()
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.param_count = count_all_params(self.model)
+        self.trainable_param_count = count_trainable_params(self.model)
+        self.hash_before = model_weight_sha256(self.model)
+        self.hash_after = self.hash_before
+
+    def _checkpoint_action_dim(self, checkpoint: Dict[str, Any]) -> int:
+        for key in ("action_dim",):
+            if key in checkpoint:
+                try:
+                    return int(checkpoint[key])
+                except Exception:
+                    pass
+        meta = checkpoint.get("action_metadata", {})
+        if isinstance(meta, dict) and "action_dim" in meta:
+            try:
+                return int(meta["action_dim"])
+            except Exception:
+                pass
+        state = checkpoint.get("model_state_dict", {})
+        weight = state.get("action_proj.weight", None) if isinstance(state, dict) else None
+        if weight is not None and hasattr(weight, "shape") and len(weight.shape) == 2:
+            return int(weight.shape[1])
+        return 0
+
+    def _validate_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        if str(checkpoint.get("scenario_frame_schema_version", "")) != SCENARIO_SCHEMA_VERSION:
+            self.error_type = "schema_mismatch_error"
+            raise ValueError("Action-FSE checkpoint schema mismatch.")
+        if int(checkpoint.get("token_dim", -1)) != SCENARIO_TOKEN_DIM or int(checkpoint.get("n_tokens", -1)) != SCENARIO_TOKEN_COUNT:
+            self.error_type = "schema_mismatch_error"
+            raise ValueError("Action-FSE checkpoint token shape mismatch.")
+        if [int(v) for v in checkpoint.get("horizons", [])] != [10, 20, 40]:
+            self.error_type = "schema_mismatch_error"
+            raise ValueError("Action-FSE checkpoint horizons must be [10,20,40].")
+        if list(checkpoint.get("risk_names", [])) != list(FSE_RISK_NAMES):
+            self.error_type = "schema_mismatch_error"
+            raise ValueError("Action-FSE checkpoint risk names mismatch.")
+        if not bool(checkpoint.get("action_conditioned", False)):
+            self.error_type = "state_conditioned_checkpoint_error"
+            raise ValueError("Action-risk runtime requires action_conditioned=True checkpoint.")
+        if int(self.action_dim) != 2 or int(self.expected_action_dim) != 2:
+            self.error_type = "action_dim_mismatch_error"
+            raise ValueError("Action-risk runtime requires action_dim=2.")
+        meta = checkpoint.get("action_metadata", {})
+        if not isinstance(meta, dict):
+            self.error_type = "action_metadata_error"
+            raise ValueError("Action-FSE checkpoint requires action_metadata.")
+        if str(meta.get("action_space", "")).strip() != FSE_ACTION_SPACE_POLICY_NORMALIZED:
+            self.error_type = "action_space_mismatch_error"
+            raise ValueError("Action-FSE checkpoint action_space must be policy_normalized_tanh.")
+        if [str(v) for v in meta.get("action_order", [])] != list(FSE_ACTION_ORDER):
+            self.error_type = "action_order_mismatch_error"
+            raise ValueError("Action-FSE checkpoint action_order mismatch.")
+        low = np.asarray(meta.get("action_low", []), dtype=np.float32).reshape(-1)
+        high = np.asarray(meta.get("action_high", []), dtype=np.float32).reshape(-1)
+        if low.shape != (2,) or high.shape != (2,) or not np.allclose(low, [-1.0, -1.0], atol=1e-6) or not np.allclose(high, [1.0, 1.0], atol=1e-6):
+            self.error_type = "action_bounds_mismatch_error"
+            raise ValueError("Action-FSE checkpoint action bounds must be [-1,1]^2.")
+
+    @staticmethod
+    def _gate_get(gate: Dict[str, Any], path: Tuple[str, ...], default: Any = None) -> Any:
+        cur: Any = gate
+        for key in path:
+            if isinstance(cur, dict) and key in cur:
+                cur = cur[key]
+            else:
+                return default
+        return cur
+
+    def _metric_float(self, gate: Dict[str, Any], path: Tuple[str, ...]) -> float:
+        raw = self._gate_get(gate, path, float("nan"))
+        try:
+            return float(raw)
+        except Exception:
+            return float("nan")
+
+    def _validate_acceptance_gate(self, gate: Dict[str, Any]) -> None:
+        blocking: List[str] = []
+        warnings: List[str] = []
+        if str(gate.get("status", "")).lower().strip() != "passed":
+            blocking.append("status != passed")
+        gate_hash = str(
+            gate.get("checkpoint_sha256")
+            or gate.get("fse_checkpoint_sha256")
+            or gate.get("checkpoint_hash")
+            or ""
+        ).strip()
+        if gate_hash != str(self.checkpoint_sha256):
+            blocking.append("checkpoint_sha256 mismatch")
+        if str(gate.get("schema_version", "")).strip() != SCENARIO_SCHEMA_VERSION:
+            blocking.append("schema_version mismatch")
+        if str(gate.get("dataset_type", "")).strip() != "same_state_branch_rollout":
+            blocking.append("dataset_type must be same_state_branch_rollout")
+        gate_action_conditioned = gate.get("action_conditioned", self._gate_get(gate, ("action_metadata", "action_conditioned"), False))
+        gate_action_dim = gate.get("action_dim", self._gate_get(gate, ("action_metadata", "action_dim"), -1))
+        gate_action_space = gate.get("action_space", self._gate_get(gate, ("action_metadata", "action_space"), ""))
+        if not bool(gate_action_conditioned):
+            blocking.append("action_conditioned must be true")
+        if int(gate_action_dim) != 2:
+            blocking.append("action_dim must be 2")
+        if str(gate_action_space).strip() != FSE_ACTION_SPACE_POLICY_NORMALIZED:
+            blocking.append("action_space must be policy_normalized_tanh")
+        pair_auc = self._metric_float(gate, ("ranking", "same_state_pair_auc"))
+        if not np.isfinite(pair_auc) or pair_auc < 0.65:
+            blocking.append("same_state_pair_auc < 0.65")
+        z_variance = self._metric_float(gate, ("z_variance",))
+        if not np.isfinite(z_variance) or z_variance <= 1e-6:
+            blocking.append("z_variance <= 1e-6")
+        if not bool(gate.get("risk_grad_smoke_passed", False)):
+            blocking.append("risk_grad_smoke_passed is not true")
+
+        profile = str(gate.get("gate_profile", "dev")).lower().strip() or "dev"
+        formal_profile = profile == "formal" or str(self.cfg.fse.run_tier).lower().strip() == "formal"
+        report_checks = [
+            ("risk_recall.collision", self._metric_float(gate, ("risk_recall", "collision")), 0.35, "min"),
+            ("risk_recall.offroad", self._metric_float(gate, ("risk_recall", "offroad")), 0.45, "min"),
+            ("risk_recall.low_ttc", self._metric_float(gate, ("risk_recall", "low_ttc")), 0.50, "min"),
+            ("calibration.ece", self._metric_float(gate, ("calibration", "ece")), 0.10, "max"),
+            ("calibration.brier", self._metric_float(gate, ("calibration", "brier")), 0.15, "max"),
+            ("monotonic_violation_rate", self._metric_float(gate, ("monotonic_violation_rate",)), 0.05, "max"),
+        ]
+        for name, value, threshold, kind in report_checks:
+            failed = (not np.isfinite(value)) or (value < threshold if kind == "min" else value > threshold)
+            if failed and formal_profile:
+                blocking.append(f"{name} failed formal threshold")
+            elif failed:
+                warnings.append(f"{name} failed dev report-only threshold")
+        if str(self.cfg.fse.run_tier).lower().strip() == "formal" and profile != "formal":
+            blocking.append("formal action-risk run requires gate_profile=formal")
+        if bool(self.cfg.fse.strict_action_gate) and warnings:
+            blocking.extend(warnings)
+        gate_blocking = gate.get("blocking_reasons", [])
+        if isinstance(gate_blocking, list) and gate_blocking:
+            blocking.extend([f"gate blocking reason: {str(v)}" for v in gate_blocking])
+        self.warning_messages.extend(warnings)
+        if blocking:
+            self.error_type = "action_risk_acceptance_gate_error"
+            raise ValueError("Action-FSE acceptance gate failed: " + "; ".join(blocking))
+
+    def freeze_fields(self) -> Dict[str, Any]:
+        self.hash_after = model_weight_sha256(self.model)
+        return {
+            "fse_action_param_count": int(self.param_count),
+            "fse_action_trainable_param_count": int(self.trainable_param_count),
+            "fse_action_nonzero_grad_param_count": int(count_nonzero_grad_params(self.model)),
+            "fse_action_hash_unchanged": float(1.0 if self.hash_before == self.hash_after else 0.0),
+        }
+
+    def audit_metadata(self) -> Dict[str, Any]:
+        return {
+            "path": os.path.abspath(self.checkpoint_path),
+            "acceptance_gate_path": os.path.abspath(self.acceptance_gate_path),
+            "fse_action_checkpoint_sha256": str(self.checkpoint_sha256),
+            "fse_action_acceptance_gate_sha256": str(self.acceptance_gate_sha256),
+            "action_dim": int(self.action_dim),
+            "action_metadata": _jsonable_plain(self.checkpoint.get("action_metadata", {})),
+            "acceptance_gate": _jsonable_plain(self.acceptance_gate),
+            "warnings": list(self.warning_messages),
+        }
+
+    def compute_penalty(
+        self,
+        tokens: torch.Tensor,
+        token_mask: torch.Tensor,
+        entity_valid_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+        token_role_ids: torch.Tensor,
+        action: torch.Tensor,
+        beta_risk: float,
+        kappa: float,
+    ) -> ActionRiskPenaltyOutput:
+        if action.dim() != 2 or action.shape[1] != int(self.action_dim):
+            raise ValueError(f"action_for_fse must have shape [B,{self.action_dim}], got {tuple(action.shape)}.")
+        action_min = float(action.detach().min().item())
+        action_max = float(action.detach().max().item())
+        if action_min < -1.0001 or action_max > 1.0001:
+            raise ValueError(f"action_for_fse must be in [-1,1], got min={action_min:.6f}, max={action_max:.6f}.")
+        # Tokens and masks are replay observations; only the action path remains differentiable.
+        out = self.model(
+            tokens.detach(),
+            token_mask.detach(),
+            entity_valid_mask.detach(),
+            token_type_ids.detach(),
+            token_role_ids.detach(),
+            action=action,
+        )
+        risk_w = torch.as_tensor(FSE_ACTION_RISK_WEIGHTS, dtype=out.risk_probs.dtype, device=out.risk_probs.device).view(1, 1, -1)
+        horizon_w = torch.as_tensor(FSE_ACTION_RISK_HORIZON_WEIGHTS, dtype=out.risk_probs.dtype, device=out.risk_probs.device).view(1, -1, 1)
+        risk_h = (out.risk_probs * risk_w).sum(dim=-1, keepdim=True)
+        risk_raw = (risk_h * horizon_w).sum(dim=1).squeeze(-1)
+        risk_norm = risk_raw / torch.clamp(risk_w.sum(), min=1e-6)
+        uncertainty_scalar = (out.uncertainty * horizon_w).sum(dim=1).squeeze(-1)
+        uncertainty_scalar = torch.clamp(uncertainty_scalar, min=0.0, max=5.0)
+        uncertainty_gate = torch.exp(-float(kappa) * uncertainty_scalar).detach()
+        risk_penalty = float(beta_risk) * uncertainty_gate * risk_norm
+        self.forward_count += 1
+        return ActionRiskPenaltyOutput(
+            risk_raw=risk_raw,
+            risk_norm=risk_norm,
+            uncertainty_scalar=uncertainty_scalar,
+            uncertainty_gate=uncertainty_gate,
+            risk_penalty=risk_penalty,
+            risk_probs=out.risk_probs,
+            uncertainty=out.uncertainty,
+        )
+
+
 def scenario_builder_config_hash(cfg: Config) -> str:
     payload = {
         "schema_version": SCENARIO_SCHEMA_VERSION,
@@ -3857,6 +4214,10 @@ def save_fse_raw_records(records: List[Dict[str, Any]], meta: Dict[str, Any], ou
             dtype = np.float32 if isinstance(first, float) else np.int64
             arrays[key] = np.asarray(values, dtype=dtype)
     arrays["actions"] = arrays["action"].astype(np.float32)
+    action_low = np.asarray(meta.get("action_space_low", []), dtype=np.float32).reshape(-1)
+    action_high = np.asarray(meta.get("action_space_high", []), dtype=np.float32).reshape(-1)
+    if action_low.shape[0] == arrays["actions"].shape[1] and action_high.shape[0] == arrays["actions"].shape[1]:
+        arrays["actions_policy_norm"] = env_action_to_policy_norm_np(arrays["actions"], action_low, action_high)
     arrays["memory_key"] = np.asarray([str(r.get("memory_key", "")) for r in records])
     raw_path = os.path.join(output_dir, "fse_raw_trajectories.npz")
     np.savez_compressed(raw_path, **arrays)
@@ -4142,7 +4503,7 @@ def fse_merge_raw(raw_list: List[Dict[str, np.ndarray]]) -> Dict[str, np.ndarray
     merged: Dict[str, np.ndarray] = {}
     for key in required:
         merged[key] = np.concatenate([raw[key] for raw in raw_list], axis=0)
-    for optional in ("memory_key", "traffic_density_id"):
+    for optional in ("memory_key", "traffic_density_id", "actions_policy_norm"):
         if all(optional in raw for raw in raw_list):
             merged[optional] = np.concatenate([raw[optional] for raw in raw_list], axis=0)
     # Raw files have local episode ids; re-map to globally unique integer ids after merge.
@@ -4368,6 +4729,11 @@ def run_fse_build_dataset(cfg: Config) -> Dict[str, Any]:
         "valid_mask": valid_mask,
         "actions": raw["actions"].astype(np.float32),
     }
+    if "actions_policy_norm" in raw:
+        dataset["actions_policy_norm"] = np.clip(raw["actions_policy_norm"].astype(np.float32), -1.0, 1.0)
+    else:
+        action_low, action_high = default_policy_action_bounds(raw["actions"].shape[1])
+        dataset["actions_policy_norm"] = env_action_to_policy_norm_np(raw["actions"].astype(np.float32), action_low, action_high)
     for key in (
         "mode_id", "seed_id", "raw_source_id", "env_seed_id", "checkpoint_seed_id", "policy_train_seed_id",
         "collect_policy_id", "source_group_id", "policy_checkpoint_uid_id", "traffic_density_id",
@@ -4389,6 +4755,13 @@ def run_fse_build_dataset(cfg: Config) -> Dict[str, Any]:
         "target_source_ratio": str(cfg.fse.source_ratio),
         "actual_source_ratio": fse_source_distribution_for_indices(dataset, np.arange(dataset["tokens"].shape[0], dtype=np.int64)),
         "label_metadata": fse_label_metadata(cfg),
+        "action_metadata": {
+            "action_space": FSE_ACTION_SPACE_POLICY_NORMALIZED,
+            "action_low": [-1.0, -1.0],
+            "action_high": [1.0, 1.0],
+            "action_order": list(FSE_ACTION_ORDER),
+            "source": "actions_policy_norm",
+        },
     }
     meta_path = export_json(meta, os.path.join(output_dir, "fse_dataset_meta.json"))
     label_distribution = {
@@ -5944,6 +6317,7 @@ class ReplayBuffer:
         raw_state_dim: int = 0,
         z_dim: int = 0,
         replay_seed: Optional[int] = None,
+        store_fse_frame_tokens: bool = False,
     ):
         self.capacity = int(capacity)
         self.device = device
@@ -5951,6 +6325,9 @@ class ReplayBuffer:
         self.raw_state_dim = int(raw_state_dim)
         self.z_dim = int(z_dim)
         self.fse_enabled = bool(self.raw_state_dim > 0 and self.z_dim > 0)
+        self.store_fse_frame_tokens = bool(store_fse_frame_tokens)
+        if self.store_fse_frame_tokens and not self.fse_enabled:
+            raise ValueError("ReplayBuffer can store FSE frame tokens only when FSE-RL is enabled.")
         seed_value = int(0 if replay_seed is None else replay_seed) % (2**32)
         self.rng = np.random.default_rng(seed_value)
         self.ptr = 0
@@ -5983,6 +6360,11 @@ class ReplayBuffer:
         self.shuffled_source_episode_id = np.full((capacity,), -1, dtype=np.int64) if self.fse_enabled else None
         self.shuffled_source_step_id = np.full((capacity,), -1, dtype=np.int64) if self.fse_enabled else None
         self.shuffled_fallback_flag = np.zeros((capacity, 1), dtype=np.float32) if self.fse_enabled else None
+        self.frame_tokens = np.zeros((capacity, SCENARIO_TOKEN_COUNT, SCENARIO_TOKEN_DIM), dtype=np.float32) if self.store_fse_frame_tokens else None
+        self.frame_token_mask = np.zeros((capacity, SCENARIO_TOKEN_COUNT), dtype=np.float32) if self.store_fse_frame_tokens else None
+        self.frame_entity_valid_mask = np.zeros((capacity, SCENARIO_TOKEN_COUNT), dtype=np.float32) if self.store_fse_frame_tokens else None
+        self.frame_token_type_ids = np.zeros((capacity, SCENARIO_TOKEN_COUNT), dtype=np.int64) if self.store_fse_frame_tokens else None
+        self.frame_token_role_ids = np.zeros((capacity, SCENARIO_TOKEN_COUNT), dtype=np.int64) if self.store_fse_frame_tokens else None
         self.episode_id = np.full((capacity,), -1, dtype=np.int64)
         self.step_in_episode = np.full((capacity,), -1, dtype=np.int32)
         self.danger_label = np.zeros((capacity,), dtype=np.int8)  # 0 normal, 1 near-danger, 2 danger/collision
@@ -6098,6 +6480,17 @@ class ReplayBuffer:
             self.shuffled_source_episode_id[self.ptr] = int(transition_meta.get("shuffled_source_episode_id", -1))
             self.shuffled_source_step_id[self.ptr] = int(transition_meta.get("shuffled_source_step_id", -1))
             self.shuffled_fallback_flag[self.ptr] = float(bool(transition_meta.get("shuffled_fallback_flag", False)))
+            if self.store_fse_frame_tokens:
+                assert self.frame_tokens is not None and self.frame_token_mask is not None
+                assert self.frame_entity_valid_mask is not None and self.frame_token_type_ids is not None and self.frame_token_role_ids is not None
+                for key in ("frame_tokens", "frame_token_mask", "frame_entity_valid_mask", "frame_token_type_ids", "frame_token_role_ids"):
+                    if key not in transition_meta:
+                        raise ValueError(f"Action-risk replay insertion requires {key}.")
+                self.frame_tokens[self.ptr] = np.asarray(transition_meta["frame_tokens"], dtype=np.float32).reshape(SCENARIO_TOKEN_COUNT, SCENARIO_TOKEN_DIM)
+                self.frame_token_mask[self.ptr] = np.asarray(transition_meta["frame_token_mask"], dtype=np.float32).reshape(SCENARIO_TOKEN_COUNT)
+                self.frame_entity_valid_mask[self.ptr] = np.asarray(transition_meta["frame_entity_valid_mask"], dtype=np.float32).reshape(SCENARIO_TOKEN_COUNT)
+                self.frame_token_type_ids[self.ptr] = np.asarray(transition_meta["frame_token_type_ids"], dtype=np.int64).reshape(SCENARIO_TOKEN_COUNT)
+                self.frame_token_role_ids[self.ptr] = np.asarray(transition_meta["frame_token_role_ids"], dtype=np.int64).reshape(SCENARIO_TOKEN_COUNT)
         self.active_indices.add(self.ptr)
         self.label_index_sets[int(self.danger_label[self.ptr])].add(self.ptr)
         key = (ep_id, step_id)
@@ -6304,6 +6697,14 @@ class ReplayBuffer:
                 "z_used_valid": torch.as_tensor(self.z_used_valid[idx], device=self.device),
                 "next_z_used_valid": torch.as_tensor(self.next_z_used_valid[idx], device=self.device),
             })
+        if self.store_fse_frame_tokens:
+            batch.update({
+                "frame_tokens": torch.as_tensor(self.frame_tokens[idx], dtype=torch.float32, device=self.device),
+                "frame_token_mask": torch.as_tensor(self.frame_token_mask[idx], dtype=torch.float32, device=self.device),
+                "frame_entity_valid_mask": torch.as_tensor(self.frame_entity_valid_mask[idx], dtype=torch.float32, device=self.device),
+                "frame_token_type_ids": torch.as_tensor(self.frame_token_type_ids[idx], dtype=torch.long, device=self.device),
+                "frame_token_role_ids": torch.as_tensor(self.frame_token_role_ids[idx], dtype=torch.long, device=self.device),
+            })
         return batch
 
 
@@ -6355,7 +6756,7 @@ class Actor(nn.Module):
         log_std = torch.clamp(self.log_std_head(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std
 
-    def sample(self, state):
+    def _sample_full(self, state):
         mu, log_std = self(state)
         std = log_std.exp()
         dist = Normal(mu, std)
@@ -6366,7 +6767,14 @@ class Actor(nn.Module):
         log_prob = log_prob - torch.log(self.action_scale + 1e-6)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         mu_action = self.action_bias + self.action_scale * torch.tanh(mu)
+        return action, log_prob, mu_action, unit_action, torch.tanh(mu)
+
+    def sample(self, state):
+        action, log_prob, mu_action, _, _ = self._sample_full(state)
         return action, log_prob, mu_action
+
+    def sample_with_normalized(self, state):
+        return self._sample_full(state)
 
 
 class SequenceEncoder(nn.Module):
@@ -6562,7 +6970,7 @@ class FSEActor(nn.Module):
         log_std = torch.clamp(self.log_std_head(h), LOG_STD_MIN, LOG_STD_MAX)
         return mu, log_std
 
-    def sample(self, state_aug: torch.Tensor):
+    def _sample_full(self, state_aug: torch.Tensor):
         mu, log_std = self(state_aug)
         std = log_std.exp()
         dist = Normal(mu, std)
@@ -6573,7 +6981,14 @@ class FSEActor(nn.Module):
         log_prob = log_prob - torch.log(self.action_scale + 1e-6)
         log_prob = log_prob.sum(dim=-1, keepdim=True)
         mu_action = self.action_bias + self.action_scale * torch.tanh(mu)
+        return action, log_prob, mu_action, unit_action, torch.tanh(mu)
+
+    def sample(self, state_aug: torch.Tensor):
+        action, log_prob, mu_action, _, _ = self._sample_full(state_aug)
         return action, log_prob, mu_action
+
+    def sample_with_normalized(self, state_aug: torch.Tensor):
+        return self._sample_full(state_aug)
 
 
 class FSECritic(nn.Module):
@@ -6616,6 +7031,8 @@ class SACAgent:
         self.tau = float(cfg.sac.tau)
         self.batch_size = int(cfg.sac.batch_size)
         self.target_entropy = float(cfg.sac.target_entropy)
+        self.update_counter = 0
+        self.action_fse_runtime: Optional[FrozenActionFSEPenaltyRuntime] = None
         self.actor = Actor(state_dim, action_dim, cfg.sac.hidden_dim, action_low, action_high).to(self.device)
         self.q1 = Critic(state_dim, action_dim, cfg.sac.hidden_dim).to(self.device)
         self.q2 = Critic(state_dim, action_dim, cfg.sac.hidden_dim).to(self.device)
@@ -6639,6 +7056,7 @@ class SACAgent:
             raw_state_dim=fse_raw_state_dim,
             z_dim=fse_z_dim,
             replay_seed=replay_seed,
+            store_fse_frame_tokens=bool(is_fse_action_risk_mode(cfg.train.mode) and fse_raw_state_dim > 0 and fse_z_dim > 0),
         )
 
     @property
@@ -6647,6 +7065,9 @@ class SACAgent:
 
     def reset_episode_context(self) -> None:
         return None
+
+    def attach_action_fse_runtime(self, runtime: Optional[FrozenActionFSEPenaltyRuntime]) -> None:
+        self.action_fse_runtime = runtime
 
     def select_action(self, state, evaluate: bool = False) -> np.ndarray:
         state_t = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -6660,6 +7081,7 @@ class SACAgent:
     def update(self) -> dict:
         if self.replay.size < self.batch_size:
             return {}
+        self.update_counter += 1
         batch = self.replay.sample(self.batch_size)
         state = batch["state"]
         action = batch["action"]
@@ -6818,6 +7240,7 @@ class LagrangianConstrainedSACAgent(SACAgent):
     def update(self) -> dict:
         if self.replay.size < self.batch_size:
             return {}
+        self.update_counter += 1
         batch = self.replay.sample(self.batch_size)
         state = batch["state"]
         action = batch["action"]
@@ -6847,14 +7270,120 @@ class LagrangianConstrainedSACAgent(SACAgent):
             "speed": self._update_cost_critic("speed", state, action, done, next_state, next_action, batch["cost_overspeed"]),
         }
 
-        new_action, log_prob, _ = self.actor.sample(state)
-        q_new = torch.min(self.q1(state, new_action), self.q2(state, new_action))
+        action_risk_enabled = bool(is_fse_action_risk_mode(self.cfg.train.mode))
+        if action_risk_enabled:
+            if self.action_fse_runtime is None:
+                raise ValueError("Action-risk mode requires an attached FrozenActionFSEPenaltyRuntime.")
+            new_action_env, log_prob, _, new_action_norm, _ = self.actor.sample_with_normalized(state)
+            action_for_q = new_action_env
+            action_for_env = new_action_env
+            action_for_fse = new_action_norm
+        else:
+            new_action_env, log_prob, _ = self.actor.sample(state)
+            action_for_q = new_action_env
+            action_for_env = new_action_env
+            action_for_fse = None
+        q_new = torch.min(self.q1(state, action_for_q), self.q2(state, action_for_q))
         cost_q = {
-            name: self._average_cost_q(self.cost_critics[name](state, new_action))
+            name: self._average_cost_q(self.cost_critics[name](state, action_for_q))
             for name in self.cost_critics.keys()
         }
         lagrangian_penalty = sum(self.lambdas[name].detach() * cost_q[name] for name in self.cost_critics.keys())
-        actor_loss = (self.alpha.detach() * log_prob - q_new + lagrangian_penalty).mean()
+        base_actor_loss_terms = self.alpha.detach() * log_prob - q_new + lagrangian_penalty
+        base_actor_loss = base_actor_loss_terms.mean()
+        actor_loss = base_actor_loss
+        action_risk_info: Dict[str, float] = {}
+        if action_risk_enabled:
+            assert action_for_fse is not None and self.action_fse_runtime is not None
+            required = ("frame_tokens", "frame_token_mask", "frame_entity_valid_mask", "frame_token_type_ids", "frame_token_role_ids")
+            missing = [key for key in required if key not in batch]
+            if missing:
+                raise ValueError(f"Action-risk replay batch missing required frame token fields: {missing}")
+            tokens_for_action_fse = batch["frame_tokens"]
+            token_mask_for_action_fse = batch["frame_token_mask"]
+            entity_valid_mask_for_action_fse = batch["frame_entity_valid_mask"]
+            token_type_ids_for_action_fse = batch["frame_token_type_ids"]
+            token_role_ids_for_action_fse = batch["frame_token_role_ids"]
+            if is_fse_action_risk_shuffled_mode(self.cfg.train.mode):
+                perm = torch.randperm(int(tokens_for_action_fse.shape[0]), device=tokens_for_action_fse.device)
+                tokens_for_action_fse = tokens_for_action_fse[perm]
+                token_mask_for_action_fse = token_mask_for_action_fse[perm]
+                entity_valid_mask_for_action_fse = entity_valid_mask_for_action_fse[perm]
+                token_type_ids_for_action_fse = token_type_ids_for_action_fse[perm]
+                token_role_ids_for_action_fse = token_role_ids_for_action_fse[perm]
+
+            action_min = float(action_for_fse.detach().min().item())
+            action_max = float(action_for_fse.detach().max().item())
+            if action_min < -1.0001 or action_max > 1.0001:
+                raise ValueError(f"action_for_fse must stay in [-1,1], got min={action_min:.6f}, max={action_max:.6f}.")
+            risk_out = self.action_fse_runtime.compute_penalty(
+                tokens=tokens_for_action_fse,
+                token_mask=token_mask_for_action_fse,
+                entity_valid_mask=entity_valid_mask_for_action_fse,
+                token_type_ids=token_type_ids_for_action_fse,
+                token_role_ids=token_role_ids_for_action_fse,
+                action=action_for_fse,
+                beta_risk=float(self.cfg.fse.action_risk_beta),
+                kappa=float(self.cfg.fse.action_risk_uncertainty_kappa),
+            )
+            risk_grad = torch.autograd.grad(
+                risk_out.risk_norm.mean(),
+                action_for_fse,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=False,
+            )[0]
+            risk_grad_norm = float(risk_grad.detach().reshape(risk_grad.shape[0], -1).norm(dim=-1).mean().item())
+            grad_base_norm = float("nan")
+            cos_grad = float("nan")
+            grad_ratio = float("nan")
+            diag_interval = max(1, int(self.cfg.fse.action_risk_grad_diag_interval))
+            if self.update_counter % diag_interval == 0:
+                grad_base = torch.autograd.grad(
+                    base_actor_loss,
+                    action_for_fse,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=False,
+                )[0]
+                grad_base_flat = grad_base.detach().reshape(grad_base.shape[0], -1)
+                grad_risk_flat = risk_grad.detach().reshape(risk_grad.shape[0], -1)
+                grad_base_norm = float(grad_base_flat.norm(dim=-1).mean().item())
+                risk_grad_norm_for_ratio = float(grad_risk_flat.norm(dim=-1).mean().item())
+                cos_grad = float(F.cosine_similarity(grad_base_flat, grad_risk_flat, dim=-1, eps=1e-8).mean().item())
+                grad_ratio = float(risk_grad_norm_for_ratio / max(grad_base_norm, 1e-8))
+            actor_loss = base_actor_loss + risk_out.risk_penalty.mean()
+            risk_active_threshold = float(self.cfg.fse.action_risk_active_threshold)
+            gate_active_threshold = float(self.cfg.fse.action_risk_gate_active_threshold)
+            risk_norm_detached = risk_out.risk_norm.detach()
+            gate_detached = risk_out.uncertainty_gate.detach()
+            risk_high = risk_norm_detached > risk_active_threshold
+            gate_suppressed = gate_detached <= gate_active_threshold
+            uncertainty = risk_out.uncertainty.detach()
+            action_risk_info = {
+                "fse_action_risk_raw_mean": float(risk_out.risk_raw.detach().mean().item()),
+                "fse_action_risk_norm_mean": float(risk_norm_detached.mean().item()),
+                "fse_action_uncertainty_h10_mean": float(uncertainty[:, 0, 0].mean().item()) if uncertainty.shape[1] > 0 else float("nan"),
+                "fse_action_uncertainty_h20_mean": float(uncertainty[:, 1, 0].mean().item()) if uncertainty.shape[1] > 1 else float("nan"),
+                "fse_action_uncertainty_h40_mean": float(uncertainty[:, 2, 0].mean().item()) if uncertainty.shape[1] > 2 else float("nan"),
+                "fse_action_uncertainty_mean": float(risk_out.uncertainty_scalar.detach().mean().item()),
+                "uncertainty_gate_mean": float(gate_detached.mean().item()),
+                "uncertainty_gate_min": float(gate_detached.min().item()),
+                "uncertainty_gate_max": float(gate_detached.max().item()),
+                "risk_penalty_mean": float(risk_out.risk_penalty.detach().mean().item()),
+                "risk_high_rate": float(risk_high.float().mean().item()),
+                "uncertainty_gate_suppressed_rate": float(gate_suppressed.float().mean().item()),
+                "risk_penalty_active_rate": float((risk_high & (~gate_suppressed)).float().mean().item()),
+                "action_for_fse_min": action_min,
+                "action_for_fse_max": action_max,
+                "action_for_fse_abs_mean": float(action_for_fse.detach().abs().mean().item()),
+                "risk_grad_norm": risk_grad_norm,
+                "cos_grad_actor_base_risk": cos_grad,
+                "grad_base_norm": grad_base_norm,
+                "grad_risk_norm": risk_grad_norm,
+                "risk_to_base_grad_norm_ratio": grad_ratio,
+                "ood_action_rate": float("nan"),
+            }
         self.actor_opt.zero_grad()
         actor_loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.cfg.sac.actor_grad_clip_norm)
@@ -6897,6 +7426,9 @@ class LagrangianConstrainedSACAgent(SACAgent):
             "batch_cost_boundary": float(batch["cost_lane"].mean().item()),
             "batch_cost_speed": float(batch["cost_overspeed"].mean().item()),
         }
+        if action_risk_info:
+            action_risk_info.update(self.action_fse_runtime.freeze_fields() if self.action_fse_runtime is not None else {})
+            out.update(action_risk_info)
         actor_gate_mean, actor_gate_std = self._module_gate_stats(self.actor)
         q1_gate_mean, q1_gate_std = self._module_gate_stats(self.q1)
         q2_gate_mean, q2_gate_std = self._module_gate_stats(self.q2)
@@ -7623,6 +8155,19 @@ def agent_checkpoint_payload(
             "allow_legacy_normalization": bool(cfg.fse.allow_legacy_normalization),
             "normalization_config_legacy_warning": bool(runtime_meta.get("normalization_config_legacy_warning", False)),
         }
+        action_runtime = getattr(agent, "action_fse_runtime", None)
+        if action_runtime is not None:
+            action_meta = action_runtime.audit_metadata()
+            payload["fse_rl"]["action_risk"] = {
+                "enabled": True,
+                "checkpoint_path": os.path.abspath(str(cfg.fse.action_risk_checkpoint_path)),
+                "checkpoint_sha256": str(action_meta.get("fse_action_checkpoint_sha256", "")),
+                "acceptance_gate_path": os.path.abspath(str(cfg.fse.action_risk_acceptance_json)),
+                "acceptance_gate_sha256": str(action_meta.get("fse_action_acceptance_gate_sha256", "")),
+                "beta": float(cfg.fse.action_risk_beta),
+                "uncertainty_kappa": float(cfg.fse.action_risk_uncertainty_kappa),
+                "action_metadata": _jsonable_plain(action_meta.get("action_metadata", {})),
+            }
     return payload
 
 
@@ -8032,6 +8577,32 @@ FSE_TRAIN_DIAGNOSTIC_FIELDS = [
     "fse_weight_delta_norm",
     "fse_forward_count",
     "fse_random_std_clipped_dims",
+    "fse_action_risk_raw_mean",
+    "fse_action_risk_norm_mean",
+    "fse_action_uncertainty_h10_mean",
+    "fse_action_uncertainty_h20_mean",
+    "fse_action_uncertainty_h40_mean",
+    "fse_action_uncertainty_mean",
+    "uncertainty_gate_mean",
+    "uncertainty_gate_min",
+    "uncertainty_gate_max",
+    "risk_penalty_mean",
+    "risk_high_rate",
+    "uncertainty_gate_suppressed_rate",
+    "risk_penalty_active_rate",
+    "action_for_fse_min",
+    "action_for_fse_max",
+    "action_for_fse_abs_mean",
+    "risk_grad_norm",
+    "cos_grad_actor_base_risk",
+    "grad_base_norm",
+    "grad_risk_norm",
+    "risk_to_base_grad_norm_ratio",
+    "ood_action_rate",
+    "fse_action_param_count",
+    "fse_action_trainable_param_count",
+    "fse_action_nonzero_grad_param_count",
+    "fse_action_hash_unchanged",
 ]
 
 for _field in FSE_TRAIN_DIAGNOSTIC_FIELDS:
@@ -8254,7 +8825,13 @@ def export_fse_z_trace(diag: Optional[FSEZDiagnostics], save_path: str) -> str:
     return export_csv(rows, save_path, fse_trace_fieldnames(rows))
 
 
-def fse_resolved_config_payload(cfg: Config, runtime: FrozenFSEBottleneckRuntime, raw_state_dim: int, action_dim: int) -> Dict[str, Any]:
+def fse_resolved_config_payload(
+    cfg: Config,
+    runtime: FrozenFSEBottleneckRuntime,
+    raw_state_dim: int,
+    action_dim: int,
+    action_runtime: Optional[FrozenActionFSEPenaltyRuntime] = None,
+) -> Dict[str, Any]:
     global_stats_path = str(cfg.fse.z_global_stats_path).strip()
     shuffle_pool_path = str(cfg.fse.shuffle_pool_path).strip()
     return {
@@ -8285,12 +8862,33 @@ def fse_resolved_config_payload(cfg: Config, runtime: FrozenFSEBottleneckRuntime
         "scenario_builder_config_hash": str(runtime.scenario_builder_config_hash),
         "script_git_sha_or_file_hash": str(runtime.script_file_hash),
         "warnings": list(runtime.warning_messages),
+        "action_risk_enabled": bool(action_runtime is not None),
+        "fse_action_risk_checkpoint_path": os.path.abspath(str(cfg.fse.action_risk_checkpoint_path)) if str(cfg.fse.action_risk_checkpoint_path).strip() else "",
+        "fse_action_risk_checkpoint_sha256": str(action_runtime.checkpoint_sha256) if action_runtime is not None else "",
+        "fse_action_risk_acceptance_json": os.path.abspath(str(cfg.fse.action_risk_acceptance_json)) if str(cfg.fse.action_risk_acceptance_json).strip() else "",
+        "fse_action_risk_acceptance_sha256": str(action_runtime.acceptance_gate_sha256) if action_runtime is not None else "",
+        "fse_action_risk_beta": float(cfg.fse.action_risk_beta),
+        "fse_action_risk_uncertainty_kappa": float(cfg.fse.action_risk_uncertainty_kappa),
+        "fse_action_risk_grad_diag_interval": int(cfg.fse.action_risk_grad_diag_interval),
+        "fse_action_risk_audit": action_runtime.audit_metadata() if action_runtime is not None else {},
     }
 
 
 def fse_assert_update_finite(update_info: Dict[str, Any]) -> None:
+    action_risk_required_finite = {
+        "fse_action_risk_raw_mean",
+        "fse_action_risk_norm_mean",
+        "fse_action_uncertainty_mean",
+        "uncertainty_gate_mean",
+        "risk_penalty_mean",
+        "risk_penalty_active_rate",
+        "risk_grad_norm",
+        "action_for_fse_min",
+        "action_for_fse_max",
+        "action_for_fse_abs_mean",
+    }
     for key, value in update_info.items():
-        if not (key.endswith("_loss") or key in ("q1_loss", "q2_loss", "actor_loss", "alpha_loss")):
+        if not (key.endswith("_loss") or key in ("q1_loss", "q2_loss", "actor_loss", "alpha_loss") or key in action_risk_required_finite):
             continue
         try:
             numeric = float(value)
@@ -8640,6 +9238,12 @@ def maybe_print_update(update_info: dict) -> None:
     )
     if "fixed_actor_penalty" in update_info:
         msg += f" fixed_penalty={update_info.get('fixed_actor_penalty', 0.0):.4f}"
+    if "risk_penalty_mean" in update_info:
+        msg += (
+            f" risk_penalty={update_info.get('risk_penalty_mean', 0.0):.4f}"
+            f" risk_grad={update_info.get('risk_grad_norm', 0.0):.4f}"
+            f" gate={update_info.get('uncertainty_gate_mean', 0.0):.4f}"
+        )
     if "lambda_safety" in update_info:
         msg += f" lambda_safety={update_info.get('lambda_safety', 0.0):.4f}"
     if "lambda_collision" in update_info and "lambda_headway" in update_info:
@@ -8891,6 +9495,7 @@ def run(cfg: Config) -> dict:
     if fse_enabled and scenario_builder is None:
         raise ValueError("FSE-RL modes require scenario frames.")
     fse_runtime: Optional[FrozenFSEBottleneckRuntime] = None
+    action_fse_runtime: Optional[FrozenActionFSEPenaltyRuntime] = None
     fse_diag: Optional[FSEZDiagnostics] = None
     resolved_config_path = ""
     state_dim = int(raw_state_dim)
@@ -8905,11 +9510,21 @@ def run(cfg: Config) -> dict:
             trace_stride=int(cfg.fse.z_trace_stride),
             trace_max_rows=int(cfg.fse.z_trace_max_rows),
         )
+        if is_fse_action_risk_mode(cfg.train.mode):
+            action_fse_runtime = FrozenActionFSEPenaltyRuntime(cfg, action_dim=action_dim, output_dir=result_dir)
         resolved_config_path = export_json(
-            fse_resolved_config_payload(cfg, fse_runtime, raw_state_dim=raw_state_dim, action_dim=action_dim),
+            fse_resolved_config_payload(
+                cfg,
+                fse_runtime,
+                raw_state_dim=raw_state_dim,
+                action_dim=action_dim,
+                action_runtime=action_fse_runtime,
+            ),
             os.path.join(result_dir, "resolved_config.json"),
         )
     agent = build_agent(state_dim, action_dim, cfg, env.action_low, env.action_high)
+    if action_fse_runtime is not None:
+        agent.attach_action_fse_runtime(action_fse_runtime)
     tb_writer, tb_run_dir = create_tensorboard_writer(cfg)
     if tb_run_dir:
         print(f"[DIAG] tensorboard run dir: {tb_run_dir}")
@@ -9036,6 +9651,16 @@ def run(cfg: Config) -> dict:
                         "shuffled_source_step_id": int(current_z.shuffled_source_step_id),
                         "shuffled_fallback_flag": bool(current_z.shuffled_fallback_flag),
                     })
+                    if is_fse_action_risk_mode(cfg.train.mode):
+                        if current_frame is None:
+                            raise ValueError("Action-risk replay insertion requires current ScenarioFrame.")
+                        transition_meta.update({
+                            "frame_tokens": np.asarray(current_frame.tokens, dtype=np.float32),
+                            "frame_token_mask": np.asarray(current_frame.token_mask, dtype=np.float32),
+                            "frame_entity_valid_mask": np.asarray(current_frame.entity_valid_mask, dtype=np.float32),
+                            "frame_token_type_ids": np.asarray(current_frame.token_type_ids, dtype=np.int64),
+                            "frame_token_role_ids": np.asarray(current_frame.token_role_ids, dtype=np.int64),
+                        })
                 agent.replay.add(
                     state_for_agent,
                     action,
@@ -9090,6 +9715,8 @@ def run(cfg: Config) -> dict:
                 train_diag_row.update(fse_runtime.freeze_fields())
                 train_diag_row["fse_forward_count"] = float(fse_runtime.fse_forward_count)
                 train_diag_row["fse_random_std_clipped_dims"] = float(fse_runtime.random_std_clipped_dims)
+            if action_fse_runtime is not None:
+                train_diag_row.update(action_fse_runtime.freeze_fields())
             train_diagnostic_rows.append(train_diag_row)
             write_tensorboard_row(tb_writer, train_diag_row, cfg.train.mode)
             print(
@@ -9158,6 +9785,13 @@ def run(cfg: Config) -> dict:
             "fse_forward_count": int(fse_runtime.fse_forward_count),
             "error_type": str(fse_runtime.error_type),
         }
+        if action_fse_runtime is not None:
+            result["metadata"]["fse_rl"]["action_risk"] = {
+                "audit": action_fse_runtime.audit_metadata(),
+                "freeze": action_fse_runtime.freeze_fields(),
+                "forward_count": int(action_fse_runtime.forward_count),
+                "error_type": str(action_fse_runtime.error_type),
+            }
         result["metadata"]["resolved_config_json_path"] = resolved_config_path
         result["metadata"]["fse_z_trace_csv_path"] = fse_trace_path
     if str(getattr(cfg.diagnostics, "checkpoint_save_path", "")).strip():
@@ -9297,6 +9931,17 @@ def parse_args():
                         help="Checkpoint path for FSE eval, or explicit save path for FSE train.")
     parser.add_argument("--fse-action-conditioned", action="store_true",
                         help="Train/evaluate an action-conditioned FSE model when dataset actions are present.")
+    parser.add_argument("--fse-action-risk-checkpoint-path", type=str, default="",
+                        help="Action-conditioned FSE checkpoint for Module-6 actor risk regularization.")
+    parser.add_argument("--fse-action-risk-acceptance-json", type=str, default="",
+                        help="Acceptance gate JSON for the action-conditioned FSE checkpoint.")
+    parser.add_argument("--strict-fse-action-gate", action="store_true",
+                        help="Treat action-FSE gate warnings as blocking errors.")
+    parser.add_argument("--fse-action-risk-beta", type=float, default=0.05)
+    parser.add_argument("--fse-action-risk-uncertainty-kappa", type=float, default=2.0)
+    parser.add_argument("--fse-action-risk-grad-diag-interval", type=int, default=50)
+    parser.add_argument("--fse-action-risk-active-threshold", type=float, default=0.05)
+    parser.add_argument("--fse-action-risk-gate-active-threshold", type=float, default=0.10)
     parser.add_argument("--fse-fusion-mode", type=str, default=None, choices=FSE_FUSION_MODES)
     parser.add_argument("--fse-z-mode", type=str, default=None, choices=FSE_Z_MODES)
     parser.add_argument("--fse-random-z-distribution", type=str, default="global_empirical_matched", choices=FSE_RANDOM_Z_DISTRIBUTIONS)
@@ -9418,6 +10063,14 @@ def apply_args(cfg: Config, args) -> Config:
     cfg.fse.output_dir = str(getattr(args, "fse_output_dir", "results/fse")).strip() or "results/fse"
     cfg.fse.checkpoint_path = str(getattr(args, "fse_checkpoint_path", "")).strip()
     cfg.fse.action_conditioned = bool(getattr(args, "fse_action_conditioned", False))
+    cfg.fse.action_risk_checkpoint_path = str(getattr(args, "fse_action_risk_checkpoint_path", "")).strip()
+    cfg.fse.action_risk_acceptance_json = str(getattr(args, "fse_action_risk_acceptance_json", "")).strip()
+    cfg.fse.strict_action_gate = bool(getattr(args, "strict_fse_action_gate", False))
+    cfg.fse.action_risk_beta = max(0.0, float(getattr(args, "fse_action_risk_beta", cfg.fse.action_risk_beta)))
+    cfg.fse.action_risk_uncertainty_kappa = max(0.0, float(getattr(args, "fse_action_risk_uncertainty_kappa", cfg.fse.action_risk_uncertainty_kappa)))
+    cfg.fse.action_risk_grad_diag_interval = max(1, int(getattr(args, "fse_action_risk_grad_diag_interval", cfg.fse.action_risk_grad_diag_interval)))
+    cfg.fse.action_risk_active_threshold = float(np.clip(getattr(args, "fse_action_risk_active_threshold", cfg.fse.action_risk_active_threshold), 0.0, 1.0))
+    cfg.fse.action_risk_gate_active_threshold = float(np.clip(getattr(args, "fse_action_risk_gate_active_threshold", cfg.fse.action_risk_gate_active_threshold), 0.0, 1.0))
     explicit_fusion_mode = getattr(args, "fse_fusion_mode", None)
     explicit_z_mode = getattr(args, "fse_z_mode", None)
     setattr(cfg.fse, "_user_explicit_fusion_mode", explicit_fusion_mode is not None)
